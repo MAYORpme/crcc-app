@@ -1,0 +1,169 @@
+rules_version = '2';
+// CRCC security rules.
+// - Nothing is readable without signing in.
+// - Members only ever see their own private records (gifts, pledges, appointments, orders…).
+// - Admin powers depend on the role in admins/{uid}: super, media, communications, finance, pastoral.
+// - Money is only recorded by the Cloud Functions (which bypass these rules) after Paystack confirms it.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function memberDoc() { return /databases/$(database)/documents/members/$(me()); }
+    function isMember() {
+      return signedIn() && exists(memberDoc()) && get(memberDoc()).data.get('blocked', false) != true;
+    }
+    function adminDoc() { return /databases/$(database)/documents/admins/$(me()); }
+    function isAdmin() { return signedIn() && exists(adminDoc()); }
+    function isSuper() { return isAdmin() && get(adminDoc()).data.role == 'super'; }
+    // hasRole(['media']) is true for media admins and super admins.
+    function hasRole(roles) { return isAdmin() && (get(adminDoc()).data.role == 'super' || get(adminDoc()).data.role in roles); }
+
+    function data() { return request.resource.data; }
+    function str(v, max) { return v is string && v.size() <= max; }
+    function changes() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function onlyChanges(keys) { return changes().hasOnly(keys); }
+
+    // ── Church content: members read, the right admins write ──
+    match /announcements/{id} { allow read: if isMember(); allow write: if hasRole(['communications']); }
+    match /adverts/{id}       { allow read: if isMember(); allow write: if hasRole(['communications']); }
+    match /events/{id}        { allow read: if isMember(); allow write: if hasRole(['communications']); }
+    match /departments/{id}   { allow read: if isMember(); allow write: if hasRole(['communications']); }
+    match /deptPosts/{id}     { allow read: if isMember(); allow write: if hasRole(['communications']); }
+    match /cells/{id}         { allow read: if isMember(); allow write: if hasRole(['communications']); }
+    match /sermons/{id}       { allow read: if isMember(); allow write: if hasRole(['media']); }
+    match /lessons/{id}       { allow read: if isMember(); allow write: if hasRole(['media']); }
+    match /devotionals/{id}   { allow read: if isMember(); allow write: if hasRole(['media']); }
+    match /albums/{id}        { allow read: if isMember(); allow write: if hasRole(['media']); }
+    match /plans/{id}         { allow read: if isMember(); allow write: if hasRole(['media']); }
+    match /projects/{id}      { allow read: if isMember(); allow write: if hasRole(['finance']); }
+    match /products/{id}      { allow read: if isMember(); allow write: if hasRole(['finance']); }
+
+    match /settings/{id} {
+      allow read: if isMember();
+      allow create, delete: if isSuper();
+      // Media and communications can only switch the livestream on/off.
+      allow update: if isSuper() || (hasRole(['media', 'communications']) && onlyChanges(['isLive', 'liveUrl']));
+    }
+
+    // ── Members ──
+    match /members/{uid} {
+      allow read: if (signedIn() && me() == uid) || hasRole(['pastoral']);
+      allow create: if signedIn() && me() == uid && str(data().name, 120) && data().get('blocked', false) == false;
+      // Members edit their own profile but can never un-pause themselves.
+      allow update: if (signedIn() && me() == uid && !changes().hasAny(['blocked', 'createdAt'])) || isSuper();
+      allow delete: if isSuper();
+    }
+    // Public birthday list: name, photo and dates only, for members who opt in.
+    match /celebrants/{uid} {
+      allow read: if isMember();
+      allow write: if (signedIn() && me() == uid && data().keys().hasOnly(['name', 'photo', 'birthday', 'anniversary'])) || isSuper();
+      allow delete: if (signedIn() && me() == uid) || isSuper();
+    }
+    match /admins/{uid} {
+      allow read: if (signedIn() && me() == uid) || isAdmin();
+      // Super admins manage roles, but nobody can change their own role.
+      allow write: if isSuper() && me() != uid;
+    }
+    match /audit/{id} {
+      allow read: if isSuper();
+      allow create: if isAdmin() && data().uid == me();
+      allow update, delete: if false;
+    }
+
+    // ── Notifications ──
+    match /notifications/{id} {
+      allow read: if isAdmin() || (isMember() && (
+        resource.data.audience == 'all' ||
+        resource.data.audience == 'user:' + me() ||
+        resource.data.audience.matches('dept:.*')));
+      allow create: if isAdmin() && str(data().title, 120) && str(data().body, 400);
+      allow update, delete: if hasRole(['communications']);
+    }
+    match /pushTokens/{token} {
+      allow create, update: if signedIn() && data().uid == me();
+      allow delete: if signedIn() && resource.data.uid == me();
+      allow read: if false;
+    }
+
+    // ── Money (written only by Cloud Functions) ──
+    match /gifts/{id} {
+      allow read: if hasRole(['finance']) || (signedIn() && resource.data.uid == me());
+      allow write: if false;
+    }
+    match /subscriptions/{id} { allow read: if hasRole(['finance']); allow write: if false; }
+
+    match /pledges/{id} {
+      allow read: if hasRole(['finance']) || (signedIn() && resource.data.uid == me());
+      allow create: if isMember() && data().uid == me() && data().paid == 0 && data().amount is number && data().amount >= 100 && str(data().title, 120);
+      allow update: if hasRole(['finance']) || (signedIn() && resource.data.uid == me() && onlyChanges(['amount', 'dueDate', 'title']));
+      allow delete: if hasRole(['finance']) || (signedIn() && resource.data.uid == me() && resource.data.paid == 0);
+    }
+    match /orders/{id} {
+      allow read: if hasRole(['finance']) || (signedIn() && resource.data.uid == me());
+      allow create: if isMember() && data().uid == me() && data().status == 'pending' && data().total is number && data().items.size() > 0;
+      allow update: if hasRole(['finance']);
+      allow delete: if signedIn() && resource.data.uid == me() && resource.data.status == 'pending';
+    }
+
+    // ── Community ──
+    match /prayers/{id} {
+      allow read: if hasRole(['pastoral']) || (isMember() && (resource.data.visibility == 'public' || resource.data.uid == me()));
+      allow create: if isMember() && data().uid == me() && str(data().text, 1500)
+        && data().visibility in ['public', 'pastors'] && data().status == 'open' && data().prayedBy.size() == 0;
+      allow update: if hasRole(['pastoral'])
+        // anyone can add/remove only themselves from "I prayed"
+        || (isMember() && resource.data.visibility == 'public' && onlyChanges(['prayedBy'])
+            && data().prayedBy.toSet().difference(resource.data.prayedBy.toSet()).hasOnly([me()])
+            && resource.data.prayedBy.toSet().difference(data().prayedBy.toSet()).hasOnly([me()]))
+        // the owner can mark it answered
+        || (signedIn() && resource.data.uid == me() && onlyChanges(['status']) && data().status == 'answered');
+      allow delete: if hasRole(['pastoral']) || (signedIn() && resource.data.uid == me());
+    }
+    match /testimonies/{id} {
+      allow read: if hasRole(['pastoral']) || (isMember() && resource.data.status == 'approved') || (signedIn() && resource.data.uid == me());
+      allow create: if isMember() && data().uid == me() && data().status == 'pending' && str(data().title, 120) && str(data().text, 4000);
+      allow update: if hasRole(['pastoral']);
+      allow delete: if hasRole(['pastoral']) || (signedIn() && resource.data.uid == me() && resource.data.status == 'pending');
+    }
+    match /appointments/{id} {
+      allow read: if hasRole(['pastoral']) || (signedIn() && resource.data.uid == me());
+      allow create: if isMember() && data().uid == me() && data().status == 'requested' && str(data().get('note', ''), 1000);
+      allow update: if hasRole(['pastoral']);
+      allow delete: if hasRole(['pastoral']) || (signedIn() && resource.data.uid == me() && resource.data.status == 'requested');
+    }
+    match /planProgress/{id} {
+      // id is "<uid>_<planId>", so members can check their own progress even before it exists
+      allow read: if signedIn() && id.matches(me() + '_.+');
+      allow create: if isMember() && data().uid == me() && id == me() + '_' + data().planId;
+      allow update: if signedIn() && resource.data.uid == me() && onlyChanges(['done']);
+      allow delete: if signedIn() && resource.data.uid == me();
+    }
+
+    // ── Attendance: the QR code is the service document's ID ──
+    match /services/{code} {
+      allow get: if isMember();
+      allow list, write: if hasRole(['pastoral']);
+    }
+    match /attendance/{id} {
+      // id is "<serviceCode>_<uid>"
+      allow read: if hasRole(['pastoral']) || (signedIn() && id.matches('.+_' + me()));
+      allow create: if isMember() && data().uid == me() && id == data().serviceId + '_' + me()
+        && get(/databases/$(database)/documents/services/$(data().serviceId)).data.open == true;
+      allow update: if false;
+      allow delete: if hasRole(['pastoral']);
+    }
+
+    // ── Forms ──
+    match /firstTimers/{id} {
+      allow read, delete: if hasRole(['pastoral']);
+      allow create: if signedIn() && data().get('uid', me()) == me() && str(data().name, 120) && str(data().phone, 30);
+    }
+    match /registrations/{id} {
+      allow read: if hasRole(['communications', 'pastoral']) || (signedIn() && resource.data.uid == me());
+      allow create, update: if isMember() && data().uid == me() && str(data().name, 120) && str(data().phone, 30)
+        && data().people is int && data().people >= 1 && data().people <= 20;
+      allow delete: if hasRole(['communications', 'pastoral']);
+    }
+  }
+}
